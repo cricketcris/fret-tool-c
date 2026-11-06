@@ -537,7 +537,7 @@ body.locked #sheet :is(.cgrip,.bargrip,.sc){pointer-events:none}
 
 <header class="top">
   <div class="toprow">
-    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18M3 9.5h18M3 14h18M3 18.5h18"/><circle cx="9" cy="9.5" r="2.2" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="2.2" fill="currentColor" stroke="none"/></svg>Fretline<!-- bump on every change --><span class="buildtag" title="Version of this file">Build 17</span></div>
+    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18M3 9.5h18M3 14h18M3 18.5h18"/><circle cx="9" cy="9.5" r="2.2" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="2.2" fill="currentColor" stroke="none"/></svg>Fretline<!-- bump on every change --><span class="buildtag" title="Version of this file">Build 18</span></div>
     <div class="titlewrap">
       <input id="title" placeholder="Song title…" aria-label="Song title" autocomplete="off">
       <div class="subline">
@@ -1045,6 +1045,9 @@ function cleanSheet(s){
   }
   s.createdAt = num(s.createdAt, 0, 9e15) || Date.now(); s.updatedAt = num(s.updatedAt, 0, 9e15) || Date.now();
   s.example = !!s.example;
+  // where a song came from when another app sent it through the inbox (used to link the two copies)
+  if (s.origin && typeof s.origin === 'object' && /^[a-z]{1,20}$/.test(s.origin.app) && /^[A-Za-z0-9_:.-]{1,80}$/.test(String(s.origin.id))) s.origin = {app:s.origin.app, id:String(s.origin.id)};
+  else delete s.origin;
   return s;
 }
 function cleanChordList(list){
@@ -1097,7 +1100,42 @@ function loadLib(){
 const LIBR = loadLib();
 let S = LIBR.sheets[LIBR.current];
 let cur = S.cursor;
-function saveLocal(){ try { localStorage.setItem(LIB_KEY, JSON.stringify(LIBR)); } catch(e) { toast('Browser storage is full or blocked — use Export › Backup to keep your work'); } }
+/* Two tabs of this page share one browser storage. Each save leaves a stamp; if the stamp changed since our last save,
+   another tab saved meanwhile, so its newer songs are folded in first instead of being written over. */
+const STAMP_KEY = 'fretline.lib.stamp';
+let libStamp = (() => { try { return localStorage.getItem(STAMP_KEY) || ''; } catch(e) { return ''; } })();
+function otherTabLib(){
+  try {
+    const o = JSON.parse(localStorage.getItem(LIB_KEY) || 'null'); if (!o || !o.sheets || typeof o.sheets !== 'object') return null;
+    const songs = new Map(), tomb = {};
+    for (const k in (o.tomb || {})) { const v = +o.tomb[k]; if (/^s-[a-z0-9]{1,40}$/i.test(k) && isFinite(v) && v > 0) tomb[k] = v; }
+    for (const id in o.sheets) {
+      const raw = o.sheets[id], mine = LIBR.sheets[id];
+      if (!raw || raw.id !== id || !/^s-[a-z0-9]{1,40}$/i.test(id)) continue;
+      if (mine && !(+raw.updatedAt > mine.updatedAt)) continue;           // only what is newer there
+      try { songs.set(id, normalize(JSON.parse(JSON.stringify(raw)))); } catch(e) {}
+    }
+    const custom = Array.isArray(o.custom) ? {at:+o.customAt || 0, list:cleanChordList(o.custom)} : null;
+    return {songs, tomb, custom};
+  } catch(e) { return null; }
+}
+function saveLocal(quiet){
+  try {
+    const st = localStorage.getItem(STAMP_KEY) || '';
+    if (st !== libStamp) {                       // another tab saved: keep its songs (but never swap the one open here mid-edit)
+      const R = otherTabLib();
+      if (R) { R.songs.delete(S.id); const ch = ghMergeIn(R); if (!LIBR.sheets[S.id]) LIBR.sheets[S.id] = S; if (ch.size && typeof renderSongbar === 'function') setTimeout(() => { try { renderSongbar(); if (!$('songsPanel').hidden) renderSongList(); } catch(e) {} }, 0); }
+    }
+    localStorage.setItem(LIB_KEY, JSON.stringify(LIBR));
+    libStamp = Date.now().toString(36) + uid(); localStorage.setItem(STAMP_KEY, libStamp);
+  } catch(e) { if (!quiet) toast('Browser storage is full or blocked — use Export › Backup to keep your work'); }
+}
+// Live: when another tab saves, bring its changes in here too.
+window.addEventListener('storage', e => {
+  if (e.key !== STAMP_KEY || !e.newValue || e.newValue === libStamp) return;
+  const R = otherTabLib(); libStamp = e.newValue; if (!R) return;
+  const changed = ghMergeIn(R); if (changed.size) ghApplyHere(changed, true);
+});
 function touch(){ S.updatedAt = Date.now(); saveLocal(); queuePush(S.id); }
 
 /* ================= undo per song ================= */
@@ -1839,7 +1877,7 @@ function setCursor(col, s=cur.s, dir=1){
   renderModPanel();
   const bar = Math.floor(cur.col / S.cols);
   for (const ch of document.querySelectorAll('.chip')) { const x = secById(ch.dataset.chip); ch.classList.toggle('here', !!x && bar >= x.start && bar <= x.end); }
-  try { localStorage.setItem(LIB_KEY, JSON.stringify(LIBR)); } catch(e) {}
+  saveLocal(true);
 }
 function scrollToSection(x){
   const el = document.querySelector(`.sechead[data-secdrop="${x.id}"], .secfold[data-secdrop="${x.id}"]`);
@@ -4021,11 +4059,10 @@ function ghMergeIn(R){
   LIBR.recent = LIBR.recent.filter(id => LIBR.sheets[id]);
   return changed;
 }
-function ghApplyHere(changed){
+function ghApplyHere(changed, fromTab){
   if (!changed.size) return;
   saveLocal();
-  GH.applying = true;
-  try { changed.forEach(id => queuePush(id)); } finally { GH.applying = false; }   // pass them on to the claude.ai account too
+  if (!fromTab) { GH.applying = true; try { changed.forEach(id => queuePush(id)); } finally { GH.applying = false; } }   // a tab's changes were already passed on by that tab   // pass them on to the claude.ai account too
   if (changed.has(S.id) || !LIBR.sheets[S.id]) {
     const id = LIBR.sheets[S.id] ? S.id : (LIBR.recent[0] || Object.values(LIBR.sheets).sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
     histories.delete(id);
@@ -4035,6 +4072,43 @@ function ghApplyHere(changed){
   } else renderSongbar();
   if (changed.has('custom-chords')) renderChords();
   if (!$('songsPanel').hidden) renderSongList();
+}
+/* Inbox: another app can leave whole sheets in fretline/inbox.json as {items:[{id, at, device, sheet}]}.
+   An item is first taken out of the inbox (with the file's sha, so two devices can't both take it) and only then added here,
+   checked like any backup. */
+const GH_INBOX = 'fretline/inbox.json';
+async function ghInbox(c){
+  const url = `https://api.github.com/repos/${c.repo}/contents/${GH_INBOX}`;
+  const hd = {Authorization:'Bearer ' + c.token, Accept:'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28'};
+  for (let tries = 0; tries < 3; tries++) {
+    const r = await ghFetch(url + `?t=${Date.now()}`, {cache:'no-store', headers:hd});
+    if (r.status === 404) return [];
+    if (!r.ok) throw ghErr(r);
+    const j = await r.json(); let doc;
+    try { doc = JSON.parse(ghB64dec(j.content || '')); } catch(e) { return []; }
+    const items = doc && Array.isArray(doc.items) ? doc.items.filter(it => it && typeof it === 'object' && it.sheet && typeof it.sheet === 'object').slice(0, 50) : [];
+    if (!items.length) return [];
+    const pr = await ghFetch(url, {method:'PUT', cache:'no-store', headers:Object.assign({'Content-Type':'application/json'}, hd),
+      body:JSON.stringify({message:`Fretline · ${c.device || 'device'} · inbox`, content:ghB64enc(JSON.stringify({app:'inbox', v:1, items:[]})), sha:j.sha})});
+    if (pr.status === 409 || pr.status === 422) continue;          // someone else changed it: read again
+    if (!pr.ok) throw ghErr(pr);
+    const added = [];
+    for (const it of items) {
+      try {
+        const x = normalize(JSON.parse(JSON.stringify(it.sheet)));
+        x.id = newSheet().id; x.example = false; x.createdAt = x.updatedAt = Date.now();
+        LIBR.sheets[x.id] = x; added.push(x);
+      } catch(e) {}
+    }
+    if (added.length) {
+      saveLocal(); added.forEach(x => queuePush(x.id));
+      renderSongbar(); if (!$('songsPanel').hidden) renderSongList();
+      toast(added.length === 1 ? `New song in your inbox: “${added[0].title || 'Untitled'}”` : `${added.length} new songs in your inbox`);
+      ghSoon(1500);
+    }
+    return added;
+  }
+  return [];
 }
 async function ghSync(why){
   const c = ghCfg(); if (!c || c.on === false) return;
@@ -4054,6 +4128,7 @@ async function ghSync(why){
       const cc = ghCfg() || c; cc.synced = Date.now(); cc.lastDevice = (!same ? c.device : doc && doc.device) || ''; ghSave(cc);
       GH.last = Date.now(); GH.err = ''; GH.state = 'ok'; GH.dirty = false; break;
     }
+    try { await ghInbox(c); } catch(e) {}
   } catch(e) {
     GH.err = e.message || String(e); GH.state = e.net ? 'offline' : 'err';
     if (!e.net && why !== 'auto') toast('GitHub: ' + GH.err);
@@ -4065,7 +4140,8 @@ function ghSoon(ms = 15000){
   if (GH.applying) return;
   const c = ghCfg(); if (!c || c.on === false) return;
   if (ms === 15000) GH.dirty = true;
-  clearTimeout(GH.timer); GH.timer = setTimeout(() => ghSync('auto'), ms);
+  const due = Date.now() + ms; if (GH.timer && GH.due && GH.due <= due) return;    // never push back a sync that is already due sooner
+  clearTimeout(GH.timer); GH.due = due; GH.timer = setTimeout(() => { GH.timer = null; GH.due = 0; ghSync('auto'); }, ms);
 }
 document.addEventListener('visibilitychange', () => {
   const c = ghCfg(); if (!c || c.on === false) return;
