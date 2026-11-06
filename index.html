@@ -537,7 +537,7 @@ body.locked #sheet :is(.cgrip,.bargrip,.sc){pointer-events:none}
 
 <header class="top">
   <div class="toprow">
-    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18M3 9.5h18M3 14h18M3 18.5h18"/><circle cx="9" cy="9.5" r="2.2" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="2.2" fill="currentColor" stroke="none"/></svg>Fretline<!-- bump on every change --><span class="buildtag" title="Version of this file">Build 18</span></div>
+    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18M3 9.5h18M3 14h18M3 18.5h18"/><circle cx="9" cy="9.5" r="2.2" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="2.2" fill="currentColor" stroke="none"/></svg>Fretline<!-- bump on every change --><span class="buildtag" title="Version of this file">Build 19</span></div>
     <div class="titlewrap">
       <input id="title" placeholder="Song title…" aria-label="Song title" autocomplete="off">
       <div class="subline">
@@ -1048,6 +1048,9 @@ function cleanSheet(s){
   // where a song came from when another app sent it through the inbox (used to link the two copies)
   if (s.origin && typeof s.origin === 'object' && /^[a-z]{1,20}$/.test(s.origin.app) && /^[A-Za-z0-9_:.-]{1,80}$/.test(String(s.origin.id))) s.origin = {app:s.origin.app, id:String(s.origin.id)};
   else delete s.origin;
+  // ids of the corrections from the practice app already applied here (it uses them to know they arrived)
+  if (Array.isArray(s.patches)) { s.patches = s.patches.filter(x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(x)).slice(-20); if (!s.patches.length) delete s.patches; }
+  else delete s.patches;
   return s;
 }
 function cleanChordList(list){
@@ -4110,6 +4113,96 @@ async function ghInbox(c){
   }
   return [];
 }
+/* Corrections from the practice app: fretline/edits.json holds {items:[{id, at, device, sheet, ops}]}.
+   They only touch notes and chords. Sections, repeats, colours, section notes, timing and the techniques the other
+   app doesn't know (vibrato, palm mute, harmonics, chord modifiers) stay as they are. Every op says what a column
+   should hold, so applying one twice changes nothing. */
+const GH_EDITS = 'fretline/edits.json';
+const chordOn = (sh, g) => sh.chords.find(c => g >= c.col && g < c.col + c.len);
+function freeColumn(sh, g){                 // take chords off column g, keeping their strums before and after it
+  const c = chordOn(sh, g); if (!c) return;
+  const o = g - c.col, end = c.col + c.len, later = Object.keys(c.strum).map(Number).filter(k => k > o).sort((a, b) => a - b);
+  if (later.length) {
+    const k = later[0], st = {};
+    for (const kk in c.strum) if (+kk >= k) st[+kk - k] = c.strum[kk];
+    sh.chords.push({id:uid(), col:c.col + k, len:end - (c.col + k), name:c.name, frets:c.frets.slice(), hidden:c.hidden, strum:st, mods:JSON.parse(JSON.stringify(c.mods || {}))});
+  }
+  if (o === 0) sh.chords.splice(sh.chords.indexOf(c), 1);
+  else { c.len = o; for (const kk in c.strum) if (+kk >= o) delete c.strum[kk]; }
+}
+function applyEdits(sh, ops){
+  const FXM = {b:'b', '/':'s', '\\':'s', h:'h', p:'p'}, OURS = ['b', 'br', 'h', 'p', 's'];
+  const fret = v => { v = String(v); return /^\d{1,2}$/.test(v) && +v <= 24 ? v : null; };
+  for (const op of (Array.isArray(ops) ? ops : []).slice(0, 5000)) {
+    if (!op || typeof op !== 'object') continue;
+    const g = Math.round(+op.g), s = Math.round(+op.s);
+    if (!(g >= 0 && g < 2000 * sh.cols)) continue;
+    const bar = Math.floor(g / sh.cols); if (bar >= sh.measures) sh.measures = bar + 1;
+    if (op.op === 'note' && s >= 0 && s <= 5) {
+      const v = fret(op.v); if (v == null) continue;
+      freeColumn(sh, g); const k = g + ',' + s; sh.notes[k] = v;
+      const f = FXM[op.fx];
+      if (f) { if (!(f === 'b' && sh.fx[k] === 'br')) sh.fx[k] = f; }
+      else if (OURS.includes(sh.fx[k])) delete sh.fx[k];     // vibrato, harmonics and palm mute stay
+    } else if (op.op === 'delNote' && s >= 0 && s <= 5) {
+      const k = g + ',' + s; delete sh.notes[k]; delete sh.fx[k];
+    } else if (op.op === 'chuck') {
+      const c = chordOn(sh, g);
+      if (c) c.strum[g - c.col] = 'M';
+      else for (const st of (Array.isArray(op.strings) ? op.strings : [0, 1, 2, 3, 4, 5])) if (st >= 0 && st <= 5) sh.notes[g + ',' + st] = 'x';
+    } else if (op.op === 'delChuck') {
+      const c = chordOn(sh, g);
+      if (c && c.strum[g - c.col] === 'M') { if (g === c.col) freeColumn(sh, g); else delete c.strum[g - c.col]; }
+      for (let st = 0; st < 6; st++) if (sh.notes[g + ',' + st] === 'x') delete sh.notes[g + ',' + st];
+    } else if (op.op === 'delStrum') {
+      const c = chordOn(sh, g); if (!c) continue;
+      if (g === c.col) freeColumn(sh, g); else delete c.strum[g - c.col];
+    } else if (op.op === 'chord' && Array.isArray(op.frets) && op.frets.length === 6) {
+      const fr = op.frets.map(f => String(f) === 'x' ? 'x' : (fret(f) ?? 'x')), d = op.dir === 'u' ? 'U' : op.dir === 'd' ? 'D' : '';
+      const c = chordOn(sh, g);
+      if (c && c.frets.join() === fr.join()) { const o = g - c.col; if (o > 0) c.strum[o] = d || c.strum[o] || 'D'; else if (d) c.strum[0] = d; continue; }
+      freeColumn(sh, g);
+      let len = 1;                          // up to the next note or chord, at most a bar
+      while (len < sh.cols && !chordOn(sh, g + len) && ![0, 1, 2, 3, 4, 5].some(st => sh.notes[(g + len) + ',' + st] !== undefined)) len++;
+      sh.chords.push({id:uid(), col:g, len, name:String(op.name || '').slice(0, 40) || '?', frets:fr, hidden:false, strum:d ? {0:d} : {}, mods:{}});
+    }
+  }
+  sh.chords.sort((a, b) => a.col - b.col);
+}
+async function ghEdits(c){
+  const url = `https://api.github.com/repos/${c.repo}/contents/${GH_EDITS}`;
+  const hd = {Authorization:'Bearer ' + c.token, Accept:'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28'};
+  for (let tries = 0; tries < 3; tries++) {
+    const r = await ghFetch(url + `?t=${Date.now()}`, {cache:'no-store', headers:hd});
+    if (r.status === 404) return 0;
+    if (!r.ok) throw ghErr(r);
+    const j = await r.json(); let doc;
+    try { doc = JSON.parse(ghB64dec(j.content || '')); } catch(e) { return 0; }
+    const items = doc && Array.isArray(doc.items) ? doc.items.filter(it => it && typeof it === 'object' && typeof it.sheet === 'string' && Array.isArray(it.ops)).slice(0, 50) : [];
+    if (!items.length) return 0;
+    const pr = await ghFetch(url, {method:'PUT', cache:'no-store', headers:Object.assign({'Content-Type':'application/json'}, hd),
+      body:JSON.stringify({message:`Fretline · ${c.device || 'device'} · corrections`, content:ghB64enc(JSON.stringify({app:'edits', v:1, items:[]})), sha:j.sha})});
+    if (pr.status === 409 || pr.status === 422) continue;
+    if (!pr.ok) throw ghErr(pr);
+    const done = [];
+    for (const it of items) {
+      const sh = LIBR.sheets[it.sheet]; if (!sh) continue;
+      const pid = /^[A-Za-z0-9_-]{1,40}$/.test(String(it.id)) ? String(it.id) : null;
+      const mark = x => { if (pid) x.patches = [...(x.patches || []).filter(y => y !== pid), pid].slice(-20); };
+      if (sh === S) { mutate(() => { applyEdits(S, it.ops); mark(S); }); done.push(S.title); continue; }
+      const before = JSON.stringify(sh);
+      try { applyEdits(sh, it.ops); mark(sh); const x = normalize(JSON.parse(JSON.stringify(sh))); x.updatedAt = Date.now(); LIBR.sheets[it.sheet] = x; queuePush(it.sheet); done.push(x.title); }
+      catch(e) { LIBR.sheets[it.sheet] = JSON.parse(before); }
+    }
+    if (done.length) {
+      saveLocal(); renderSongbar(); if (!$('songsPanel').hidden) renderSongList();
+      toast(done.length === 1 ? `Corrections arrived for “${done[0] || 'Untitled'}”` : `Corrections arrived for ${done.length} songs`);
+      ghSoon(1500);
+    }
+    return done.length;
+  }
+  return 0;
+}
 async function ghSync(why){
   const c = ghCfg(); if (!c || c.on === false) return;
   if (GH.busy) { GH.again = true; return; }
@@ -4129,6 +4222,7 @@ async function ghSync(why){
       GH.last = Date.now(); GH.err = ''; GH.state = 'ok'; GH.dirty = false; break;
     }
     try { await ghInbox(c); } catch(e) {}
+    try { await ghEdits(c); } catch(e) {}
   } catch(e) {
     GH.err = e.message || String(e); GH.state = e.net ? 'offline' : 'err';
     if (!e.net && why !== 'auto') toast('GitHub: ' + GH.err);
