@@ -4062,7 +4062,7 @@ function ghMergeIn(R){
 function ghApplyHere(changed, fromTab){
   if (!changed.size) return;
   saveLocal();
-  if (!fromTab) { GH.applying = true; try { changed.forEach(id => queuePush(id)); } finally { GH.applying = false; } }   // a tab's changes were already passed on by that tab   // pass them on to the claude.ai account too
+  if (!fromTab) { GH.applying = true; try { changed.forEach(id => queuePush(id)); } finally { GH.applying = false; } }   // pass them on to the claude.ai account too (a tab's changes were already passed on by that tab)
   if (changed.has(S.id) || !LIBR.sheets[S.id]) {
     const id = LIBR.sheets[S.id] ? S.id : (LIBR.recent[0] || Object.values(LIBR.sheets).sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
     histories.delete(id);
